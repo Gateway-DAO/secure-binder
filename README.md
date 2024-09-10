@@ -40,6 +40,13 @@ Once installed and built, Secure Binder can be used in conjunction with an EDV a
 cargo run
 ```
 
+For development with auto watch, we are using [cargo watch](https://sagiegurari.github.io/cargo-make/)
+
+After install, just run:
+```
+cargo make dev
+```
+
 #### SecureBinder will:
 
 - Retrieve data from the EDV using secure communication.
