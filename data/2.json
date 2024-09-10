@@ -1,0 +1,9 @@
+{
+  "firstName": "Jessica",
+  "lastName": "Mae",
+  "age": 24,
+  "colleagues": [
+    "Jane"
+  ],
+  "link": "https://www.google.com"
+}
