@@ -2,8 +2,8 @@ use serde_json::Value;
 
 use crate::infrastructure::data_loader;
 
-pub fn load_data() -> Result<Value, String> {
-    match data_loader::load_json_file() {
+pub fn load_data(ids: Vec<u64>) -> Result<Value, String> {
+    match data_loader::load_jsonfiles_by_ids(ids) {
         Ok(data) => {
             println!("Data loaded successfully: {}", data);
             Ok(data)

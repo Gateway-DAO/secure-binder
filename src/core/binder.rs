@@ -1,12 +1,14 @@
 use crate::core::loader;
 
-pub fn run_binder() -> Result<(), String> {
-    match loader::load_data() {
+pub fn run_binder(ids: Vec<u64>, param: String) -> Result<(), String> {
+    match loader::load_data(ids) {
         Ok(data) => {
-            if let Some(age) = data.get("age").and_then(|v| v.as_u64()) {
-                println!("Age: {}", age);
-            } else {
-                println!("Age not found");
+            for (id, entry) in data.as_object().unwrap().iter() {
+                if let Some(value) = entry.get(&param) {
+                    println!("ID: {}, {}: {}", id, param, value);
+                } else {
+                    println!("Param '{}' not found for ID: {}", param, id);
+                }
             }
 
             Ok(())
