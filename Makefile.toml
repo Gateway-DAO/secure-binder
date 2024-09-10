@@ -1,0 +1,9 @@
+[tasks.format]
+install_crate = "rustfmt"
+command = "cargo"
+args = ["fmt", "--", "--emit=files"]
+
+[tasks.dev]
+description = "Watch for changes and run the application"
+command = "cargo"
+args = ["watch", "-x", "run"]

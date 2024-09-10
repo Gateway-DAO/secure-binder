@@ -1,4 +1,8 @@
-use secure_binder::core::binder;
+mod core;
+mod infrastructure;
+mod interfaces;
+
+use crate::core::binder;
 
 fn main() {
     match binder::run_binder() {
