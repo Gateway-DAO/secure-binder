@@ -2,13 +2,12 @@ use crate::core::loader;
 use fancy_garbling::FancyInput;
 use fancy_garbling::{
     twopac::semihonest::{Evaluator as FancyEvaluator, Garbler as FancyGarbler},
-    util, AllWire, BinaryBundle, BinaryGadgets, Fancy, FancyArithmetic, FancyBinary, FancyReveal,
+    util, AllWire, BinaryBundle, BinaryGadgets, Fancy, FancyBinary, FancyReveal,
 };
 use ocelot::ot::{AlszReceiver as OtReceiver, AlszSender as OtSender};
 use scuttlebutt::AesRng;
 use scuttlebutt::{AbstractChannel, Channel};
 use std::io::BufReader;
-
 use std::{io::BufWriter, os::unix::net::UnixStream};
 
 pub fn run_binder(ids: Vec<u64>, param: String) -> Result<(), String> {
@@ -40,9 +39,11 @@ pub fn run_binder(ids: Vec<u64>, param: String) -> Result<(), String> {
                 return Err("No data found for the given param".into());
             }
 
-            // Call the fancy garbling summation with the selected_data
-            let result = garbled_sum(selected_data)?;
-            println!("Garbled Circuit Sum Result: {}", result);
+            // Call the fancy garbling comparison with the selected_data
+            for value in selected_data {
+                let result = garbled_compare(value as u128)?;
+                println!("Is {} greater than or equal to 18? {}", value, result);
+            }
 
             Ok(())
         }
@@ -58,11 +59,11 @@ struct SUMInputs<F> {
     pub evaluator_wires: BinaryBundle<F>,
 }
 
-fn garbled_sum(selected_data: Vec<u16>) -> Result<u128, String> {
+fn garbled_compare(input: u128) -> Result<bool, String> {
     let (sender, receiver) = UnixStream::pair().unwrap();
 
-    let garbler_input: u128 = selected_data.iter().map(|&x| x as u128).sum(); // Summing for the garbler
-    let evaluator_input: u128 = 0; // For simplicity, the evaluator can be 0
+    let garbler_input: u128 = input; // Input to be compared
+    let evaluator_input: u128 = 18; // The constant to compare against (18)
 
     // Spawn a thread for the garbler
     std::thread::spawn(move || {
@@ -70,7 +71,7 @@ fn garbled_sum(selected_data: Vec<u16>) -> Result<u128, String> {
         let reader = BufReader::new(sender.try_clone().unwrap());
         let writer = BufWriter::new(sender);
         let mut channel = Channel::new(reader, writer);
-        gb_sum(&mut rng_gb.clone(), &mut channel, garbler_input);
+        gb_compare(&mut rng_gb.clone(), &mut channel, garbler_input);
     });
 
     // The evaluator runs on the main thread
@@ -79,20 +80,13 @@ fn garbled_sum(selected_data: Vec<u16>) -> Result<u128, String> {
     let writer = BufWriter::new(receiver);
     let mut channel = Channel::new(reader, writer);
 
-    // Sum in clear for verification (optional)
-    let expected_sum = selected_data.iter().map(|&x| x as u128).sum::<u128>();
-    let result = ev_sum(&mut rng_ev.clone(), &mut channel, evaluator_input);
-
-    println!("Expected sum in clear: {}", expected_sum);
-    assert!(
-        result == expected_sum,
-        "The garbled circuit result is incorrect"
-    );
+    // Perform comparison in the garbled circuit
+    let result = ev_compare(&mut rng_ev.clone(), &mut channel, evaluator_input);
 
     Ok(result)
 }
 
-fn gb_sum<C>(rng: &mut AesRng, channel: &mut C, input: u128)
+fn gb_compare<C>(rng: &mut AesRng, channel: &mut C, input: u128)
 where
     C: AbstractChannel + std::clone::Clone,
 {
@@ -100,22 +94,16 @@ where
         FancyGarbler::<C, AesRng, OtSender, AllWire>::new(channel.clone(), rng.clone()).unwrap();
     let circuit_wires = gb_set_fancy_inputs(&mut gb, input);
 
-    // Debug: Display garbler wire labels
-    println!(
-        "Garbler wire labels (obfuscated): {:?}",
-        circuit_wires.garbler_wires.wires()
-    );
+    // Perform greater-than-or-equal-to comparison using bin_geq
+    let result = gb
+        .bin_geq(&circuit_wires.garbler_wires, &circuit_wires.evaluator_wires)
+        .unwrap();
 
-    let sum =
-        fancy_sum::<FancyGarbler<C, AesRng, OtSender, AllWire>>(&mut gb, circuit_wires).unwrap();
-
-    // Debug: Display sum wire labels before output
-    println!("Sum wire labels (garbler side): {:?}", sum.wires());
-
-    gb.outputs(sum.wires()).unwrap();
+    // Pass the result directly to `outputs` as it is a single wire
+    gb.outputs(&[result]).unwrap();
 }
 
-fn ev_sum<C>(rng: &mut AesRng, channel: &mut C, input: u128) -> u128
+fn ev_compare<C>(rng: &mut AesRng, channel: &mut C, input: u128) -> bool
 where
     C: AbstractChannel + std::clone::Clone,
 {
@@ -124,24 +112,19 @@ where
             .unwrap();
     let circuit_wires = ev_set_fancy_inputs(&mut ev, input);
 
-    // Debug: Display evaluator wire labels
-    println!(
-        "Evaluator wire labels (obfuscated): {:?}",
-        circuit_wires.evaluator_wires.wires()
-    );
-
-    let sum = fancy_sum::<FancyEvaluator<C, AesRng, OtReceiver, AllWire>>(&mut ev, circuit_wires)
+    // Perform greater-than-or-equal-to comparison using bin_geq
+    let result = ev
+        .bin_geq(&circuit_wires.garbler_wires, &circuit_wires.evaluator_wires)
         .unwrap();
 
-    let sum_binary = ev
-        .outputs(sum.wires())
+    // Pass the result directly to `outputs` as it is a single wire
+    let result_binary = ev
+        .outputs(&[result])
         .unwrap()
         .expect("evaluator should produce outputs");
 
-    // Debug: Output sum in binary form
-    println!("Sum in binary (evaluator side): {:?}", sum_binary);
-
-    util::u128_from_bits(&sum_binary)
+    // Interpret the result as boolean (true if x >= y, false otherwise)
+    util::u128_from_bits(&result_binary) == 1
 }
 
 fn gb_set_fancy_inputs<F, E>(gb: &mut F, input: u128) -> SUMInputs<F::Item>
@@ -152,9 +135,6 @@ where
     let nbits = 128;
     let garbler_wires: BinaryBundle<F::Item> = gb.bin_encode(input, nbits).unwrap();
     let evaluator_wires: BinaryBundle<F::Item> = gb.bin_receive(nbits).unwrap();
-
-    // Debug: Print garbler wire labels (obfuscated)
-    println!("Garbler wire labels: {:?}", garbler_wires.wires());
 
     SUMInputs {
         garbler_wires,
@@ -171,23 +151,8 @@ where
     let garbler_wires: BinaryBundle<F::Item> = ev.bin_receive(nbits).unwrap();
     let evaluator_wires: BinaryBundle<F::Item> = ev.bin_encode(input, nbits).unwrap();
 
-    // Debug: Print evaluator wire labels (obfuscated)
-    println!("Evaluator wire labels: {:?}", evaluator_wires.wires());
-
     SUMInputs {
         garbler_wires,
         evaluator_wires,
     }
-}
-
-fn fancy_sum<F>(
-    f: &mut F,
-    wire_inputs: SUMInputs<F::Item>,
-) -> Result<BinaryBundle<F::Item>, F::Error>
-where
-    F: FancyReveal + Fancy + BinaryGadgets + FancyBinary + FancyArithmetic,
-{
-    let sum = f.bin_addition_no_carry(&wire_inputs.garbler_wires, &wire_inputs.evaluator_wires)?;
-
-    Ok(sum)
 }

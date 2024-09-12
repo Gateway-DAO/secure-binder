@@ -1,7 +1,10 @@
 {
   "firstName": "Brian",
   "lastName": "Doe",
-  "age": 18,
-  "colleagues": ["Jane", "John"],
+  "age": 14,
+  "colleagues": [
+    "Jane",
+    "John"
+  ],
   "link": "https://www.google.com"
 }
