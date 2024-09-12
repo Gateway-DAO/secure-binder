@@ -5,7 +5,7 @@ mod interfaces;
 use crate::core::binder;
 
 fn main() {
-    let test_ids = vec![1, 2];
+    let test_ids = vec![1, 2, 3];
     let test_param = "age".to_string();
 
     match binder::run_binder(test_ids, test_param) {
