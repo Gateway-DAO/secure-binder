@@ -1,14 +1,15 @@
 use crate::core::loader;
-
+use fancy_garbling::FancyInput;
 use fancy_garbling::{
-    circuit::{BinaryCircuit as Circuit, EvaluableCircuit},
-    twopac::semihonest::{Evaluator, Garbler},
-    FancyInput, WireMod2,
+    twopac::semihonest::{Evaluator as FancyEvaluator, Garbler as FancyGarbler},
+    util, AllWire, BinaryBundle, BinaryGadgets, Fancy, FancyArithmetic, FancyBinary, FancyReveal,
 };
 use ocelot::ot::{AlszReceiver as OtReceiver, AlszSender as OtSender};
-use scuttlebutt::{unix_channel_pair, AesRng, UnixChannel};
-use serde_json::Value;
-use std::{fs::File, io::BufReader, time::SystemTime};
+use scuttlebutt::AesRng;
+use scuttlebutt::{AbstractChannel, Channel};
+use std::io::BufReader;
+
+use std::{io::BufWriter, os::unix::net::UnixStream};
 
 pub fn run_binder(ids: Vec<u64>, param: String) -> Result<(), String> {
     match loader::load_data(ids) {
@@ -34,15 +35,15 @@ pub fn run_binder(ids: Vec<u64>, param: String) -> Result<(), String> {
                 }
             }
 
-            println!("It is an {:?}", selected_data);
-
-            let mut circ = circuit("circuits/adder_32bit.txt");
+            println!("Selected data: {:?}", selected_data);
 
             if selected_data.is_empty() {
                 return Err("No data found for the given param".into());
             }
 
-            run_circuit(&mut circ, selected_data.clone(), vec![]);
+            // Call the fancy garbling summation with the selected_data
+            let result = garbled_sum(selected_data)?;
+            println!("Garbled Circuit Sum Result: {}", result);
 
             Ok(())
         }
@@ -52,83 +53,125 @@ pub fn run_binder(ids: Vec<u64>, param: String) -> Result<(), String> {
         }
     }
 }
+struct SUMInputs<F> {
+    pub garbler_wires: BinaryBundle<F>,
+    pub evaluator_wires: BinaryBundle<F>,
+}
 
-fn ot_create_and_send(
-    gb_inputs: Vec<u16>,
-    circ_: Circuit,
-    sender: UnixChannel,
-    n_ev_inputs: usize,
-) -> std::thread::JoinHandle<()> {
+fn garbled_sum(selected_data: Vec<u16>) -> Result<u128, String> {
+    let (sender, receiver) = UnixStream::pair().unwrap();
+
+    let garbler_input: u128 = selected_data.iter().map(|&x| x as u128).sum(); // Summing for the garbler
+    let evaluator_input: u128 = 0; // For simplicity, the evaluator can be 0
+
+    // Spawn a thread for the garbler
     std::thread::spawn(move || {
-        let rng = AesRng::new();
-        let mut gb = Garbler::<UnixChannel, AesRng, OtSender, WireMod2>::new(sender, rng).unwrap();
-        println!("Garbler :: Initialization complete.");
+        let rng_gb = AesRng::new();
+        let reader = BufReader::new(sender.try_clone().unwrap());
+        let writer = BufWriter::new(sender);
+        let mut channel = Channel::new(reader, writer);
+        gb_sum(&mut rng_gb.clone(), &mut channel, garbler_input);
+    });
 
-        // Encode inputs
-        let xs = gb
-            .encode_many(&gb_inputs, &vec![2; gb_inputs.len()])
-            .unwrap();
-        let ys = gb.receive_many(&vec![2; n_ev_inputs]).unwrap();
+    // The evaluator runs on the main thread
+    let rng_ev = AesRng::new();
+    let reader = BufReader::new(receiver.try_clone().unwrap());
+    let writer = BufWriter::new(receiver);
+    let mut channel = Channel::new(reader, writer);
 
-        // Garble the circuit
-        circ_.eval(&mut gb, &xs, &ys).unwrap();
-        println!("Garbler :: Circuit garbling complete.");
-    })
+    // Sum in clear for verification (optional)
+    let expected_sum = selected_data.iter().map(|&x| x as u128).sum::<u128>();
+    let result = ev_sum(&mut rng_ev.clone(), &mut channel, evaluator_input);
+
+    println!("Expected sum in clear: {}", expected_sum);
+    assert!(
+        result == expected_sum,
+        "The garbled circuit result is incorrect"
+    );
+
+    Ok(result)
 }
 
-fn circuit(fname: &str) -> Circuit {
-    println!("* Loading Circuit: {}", fname);
-    Circuit::parse(BufReader::new(File::open(fname).unwrap())).unwrap()
+/// The garbler's main method:
+/// (1) The garbler is first created using the passed rng and value.
+/// (2) The garbler then exchanges their wires obliviously with the evaluator.
+/// (3) The garbler and the evaluator then run the garbled circuit.
+/// (4) The garbler and the evaluator open the result of the computation.
+fn gb_sum<C>(rng: &mut AesRng, channel: &mut C, input: u128)
+where
+    C: AbstractChannel + std::clone::Clone,
+{
+    let mut gb =
+        FancyGarbler::<C, AesRng, OtSender, AllWire>::new(channel.clone(), rng.clone()).unwrap();
+    let circuit_wires = gb_set_fancy_inputs(&mut gb, input);
+    let sum =
+        fancy_sum::<FancyGarbler<C, AesRng, OtSender, AllWire>>(&mut gb, circuit_wires).unwrap();
+    gb.outputs(sum.wires()).unwrap();
 }
 
-fn ot_receive(
-    receiver: UnixChannel,
-    ev_inputs: Vec<u16>,
-    n_gb_inputs: usize,
-) -> (Vec<WireMod2>, Vec<WireMod2>) {
-    let rng = AesRng::new();
+/// The evaluator's main method:
+/// (1) The evaluator is first created using the passed rng and value.
+/// (2) The evaluator then exchanges their wires obliviously with the garbler.
+/// (3) The evaluator and the garbler then run the garbled circuit.
+/// (4) The evaluator and the garbler open the result of the computation.
+fn ev_sum<C>(rng: &mut AesRng, channel: &mut C, input: u128) -> u128
+where
+    C: AbstractChannel + std::clone::Clone,
+{
     let mut ev =
-        Evaluator::<UnixChannel, AesRng, OtReceiver, WireMod2>::new(receiver, rng).unwrap();
-    println!("Evaluator :: Initialization complete.");
-
-    // Receive Garbler inputs
-    let xs = ev.receive_many(&vec![2; n_gb_inputs]).unwrap();
-    let ys = ev
-        .encode_many(&ev_inputs, &vec![2; ev_inputs.len()])
+        FancyEvaluator::<C, AesRng, OtReceiver, AllWire>::new(channel.clone(), rng.clone())
+            .unwrap();
+    let circuit_wires = ev_set_fancy_inputs(&mut ev, input);
+    let sum = fancy_sum::<FancyEvaluator<C, AesRng, OtReceiver, AllWire>>(&mut ev, circuit_wires)
         .unwrap();
 
-    (xs, ys)
+    let sum_binary = ev
+        .outputs(sum.wires())
+        .unwrap()
+        .expect("evaluator should produce outputs");
+    util::u128_from_bits(&sum_binary)
 }
 
-fn compute_circuit(
-    circ: &mut Circuit,
-    xs: Vec<WireMod2>,
-    ys: Vec<WireMod2>,
-    receiver: UnixChannel,
-    rng: AesRng,
-) {
-    let mut evaluator =
-        Evaluator::<UnixChannel, AesRng, OtReceiver, WireMod2>::new(receiver, rng).unwrap();
-    circ.eval(&mut evaluator, &xs, &ys).unwrap();
-    println!("Circuit evaluation complete.");
+/// The garbler's wire exchange method
+fn gb_set_fancy_inputs<F, E>(gb: &mut F, input: u128) -> SUMInputs<F::Item>
+where
+    F: FancyInput<Item = AllWire, Error = E>,
+    E: std::fmt::Debug,
+{
+    let nbits = 128;
+    let garbler_wires: BinaryBundle<F::Item> = gb.bin_encode(input, nbits).unwrap();
+    let evaluator_wires: BinaryBundle<F::Item> = gb.bin_receive(nbits).unwrap();
+
+    SUMInputs {
+        garbler_wires,
+        evaluator_wires,
+    }
 }
 
-fn run_circuit(circ: &mut Circuit, gb_inputs: Vec<u16>, ev_inputs: Vec<u16>) {
-    let circ_ = circ.clone();
-    let (sender, receiver) = unix_channel_pair();
-    let n_gb_inputs = gb_inputs.len();
-    let n_ev_inputs = ev_inputs.len();
+/// The evaluator's wire exchange method
+fn ev_set_fancy_inputs<F, E>(ev: &mut F, input: u128) -> SUMInputs<F::Item>
+where
+    F: FancyInput<Item = AllWire, Error = E>,
+    E: std::fmt::Debug,
+{
+    let nbits = 128;
+    let garbler_wires: BinaryBundle<F::Item> = ev.bin_receive(nbits).unwrap();
+    let evaluator_wires: BinaryBundle<F::Item> = ev.bin_encode(input, nbits).unwrap();
 
-    // Step 1: Create and send OT
-    let handle = ot_create_and_send(gb_inputs, circ_, sender, n_ev_inputs);
+    SUMInputs {
+        garbler_wires,
+        evaluator_wires,
+    }
+}
 
-    // Step 2: Receive OT and initialize rng
-    let rng = AesRng::new();
-    let (xs, ys) = ot_receive(receiver.clone(), ev_inputs, n_gb_inputs);
-
-    // Step 3: Compute the circuit
-    compute_circuit(circ, xs, ys, receiver, rng);
-
-    // Wait for the Garbler's thread to complete
-    handle.join().unwrap();
+/// The main fancy function which describes the garbled circuit for summation.
+fn fancy_sum<F>(
+    f: &mut F,
+    wire_inputs: SUMInputs<F::Item>,
+) -> Result<BinaryBundle<F::Item>, F::Error>
+where
+    F: FancyReveal + Fancy + BinaryGadgets + FancyBinary + FancyArithmetic,
+{
+    let sum = f.bin_addition_no_carry(&wire_inputs.garbler_wires, &wire_inputs.evaluator_wires)?;
+    Ok(sum)
 }
